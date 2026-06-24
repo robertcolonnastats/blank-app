@@ -1,0 +1,43 @@
+name: Daily Mets MiLB Stats Pull
+
+on:
+  schedule:
+    # GitHub Actions cron is UTC only (no timezone support), and the UTC
+    # offset for US Eastern time changes with daylight saving:
+    #   - During EST (winter, UTC-5): 3:00 AM ET = 08:00 UTC -> "0 8 * * *"
+    #   - During EDT (summer, UTC-4): 3:00 AM ET = 07:00 UTC -> "0 7 * * *"
+    # Two schedules are listed below so it stays at ~3am ET year-round;
+    # GitHub will just run both, so you'll occasionally get two runs in
+    # one day during the DST transition weeks -- harmless, just redundant.
+    - cron: "0 8 * * *"
+    - cron: "0 7 * * *"
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  pull-stats:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests pandas openpyxl
+
+      - name: Run pull
+        run: python pull_and_save.py
+
+      - name: Commit updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/mets_milb_latest.xlsx data/last_updated.txt
+          git diff --quiet --cached || git commit -m "Automated daily Mets MiLB stats pull"
+          git push
