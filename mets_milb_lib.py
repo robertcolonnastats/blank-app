@@ -155,6 +155,8 @@ def get_game_events(game_pk):
             pitches.append({
                 "pitcherId": pitcher.get("id"),
                 "pitcherName": pitcher.get("fullName"),
+                "batterId": batter.get("id"),
+                "batterName": batter.get("fullName"),
                 "pitch_type": pitch_type_info.get("code"),
                 "pitch_desc": pitch_type_info.get("description"),
                 "start_speed": pitch_data.get("startSpeed"),
@@ -320,16 +322,31 @@ def compute_tool_grades(hitting):
 
     df = hitting.copy()
 
-    # --- Hit: contact rate + AVG, plus Statcast contact quality if tracked
+    # --- Hit: contact rate + AVG, plus real swing-decision data (chase%,
+    # whiff%, zone-contact%) where pitch-level zone/call data is tracked,
+    # plus Statcast contact quality where that's tracked too.
     df["_z_contact"] = -df.groupby("level")["K_pct"].transform(zscore)
     df["_z_avg"] = df.groupby("level")["avg"].transform(lambda s: zscore(pd.to_numeric(s, errors="coerce")))
     hit_cols = ["_z_contact", "_z_avg"]
+    has_approach_data = "chase_pct" in df.columns
+    if has_approach_data:
+        df["_z_chase_inv"] = -df.groupby("level")["chase_pct"].transform(zscore)
+        df["_z_bwhiff_inv"] = -df.groupby("level")["batter_whiff_pct"].transform(zscore)
+        df["_z_zonecontact"] = df.groupby("level")["zone_contact_pct"].transform(zscore)
+        hit_cols += ["_z_chase_inv", "_z_bwhiff_inv", "_z_zonecontact"]
     if "avg_exit_velocity" in df.columns:
         df["_z_ev_hit"] = df.groupby("level")["avg_exit_velocity"].transform(zscore)
         df["_z_hardhit_hit"] = df.groupby("level")["hard_hit_pct"].transform(zscore)
         hit_cols += ["_z_ev_hit", "_z_hardhit_hit"]
     df["_hit_z"] = df.apply(lambda r: _row_mean_ignore_none(r, hit_cols), axis=1)
     df["hit_grade"] = df["_hit_z"].apply(to_20_80)
+    df["hit_grade_confidence"] = (
+        "medium-high (contact rate, AVG, chase%, whiff%, zone-contact%"
+        + (", Statcast contact quality)" if "avg_exit_velocity" in df.columns else ")")
+        if has_approach_data else
+        "medium (contact rate + AVG only -- no pitch-level swing-decision data at this level; "
+        "still no quality-of-competition adjustment, since that data doesn't exist publicly anywhere)"
+    )
 
     # --- Power: ISO + HR rate, plus Statcast max EV/barrel% if tracked
     df["_hr_rate"] = df.apply(lambda r: safe_div(r.get("homeRuns"), r.get("plateAppearances")), axis=1)
@@ -644,6 +661,49 @@ def summarize_pitcher_rollup(pitches_df):
     return pd.DataFrame(rows)
 
 
+def summarize_hitter_approach(pitches_df):
+    """Real swing-decision data from the batter's side of the same
+    pitch-level feed: chase% (swinging at pitches out of the zone),
+    swinging-strike% (whiffs per pitch seen), and zone-contact% (contact
+    rate when swinging at pitches in the zone). Zone/call data is base
+    Gameday infrastructure, not Statcast-exclusive, so this should have
+    real coverage well beyond just the Statcast-tracked levels -- but as
+    with everything else here, coverage is determined by what actually
+    comes back, not assumed in advance."""
+    if pitches_df is None or pitches_df.empty or "batterId" not in pitches_df.columns:
+        return pd.DataFrame()
+
+    df = pitches_df.dropna(subset=["batterId"]).copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df["is_swing"] = df["call_description"].isin(SWING_DESCRIPTIONS)
+    df["is_whiff"] = df["call_description"].isin(WHIFF_DESCRIPTIONS)
+    df["in_zone"] = df["zone"].apply(lambda z: z in IN_ZONE_CODES if pd.notna(z) else None)
+
+    rows = []
+    for bid, g in df.groupby("batterId"):
+        n = len(g)
+        swings = g["is_swing"].sum()
+        whiffs = g["is_whiff"].sum()
+        zone_known = g["in_zone"].notna().sum()
+        out_of_zone = (g["in_zone"] == False).sum()  # noqa: E712
+        chase_swings = ((g["is_swing"]) & (g["in_zone"] == False)).sum()  # noqa: E712
+        zone_swings = ((g["is_swing"]) & (g["in_zone"] == True)).sum()  # noqa: E712
+        zone_whiffs = ((g["is_whiff"]) & (g["in_zone"] == True)).sum()  # noqa: E712
+
+        rows.append({
+            "playerId": bid,
+            "pitches_seen": n,
+            "swing_pct": (swings / n) if n else None,
+            "batter_whiff_pct": (whiffs / swings) if swings >= 10 else None,
+            "chase_pct": (chase_swings / out_of_zone) if out_of_zone >= 10 else None,
+            "zone_contact_pct": ((zone_swings - zone_whiffs) / zone_swings) if zone_swings >= 10 else None,
+            "has_pitch_tracking_batter": zone_known > 0,
+        })
+    return pd.DataFrame(rows)
+
+
 def compute_pitcher_grades(pitching):
     """Adds control_grade, stuff_grade, and pitching_overall_fv (20-80)
     to the pitching dataframe, using whatever pitch-tracking data is
@@ -815,6 +875,10 @@ def build_full(season, progress_callback=None):
     rollup = summarize_pitcher_rollup(all_pitches_df)
     if not rollup.empty and not pitching.empty:
         pitching = pitching.merge(rollup, on="playerId", how="left")
+
+    hitter_approach = summarize_hitter_approach(all_pitches_df)
+    if not hitter_approach.empty and not hitting.empty:
+        hitting = hitting.merge(hitter_approach, on="playerId", how="left")
 
     # Now compute scores/grades -- after everything above is merged in,
     # so these functions can detect and use whatever's actually present.
