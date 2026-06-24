@@ -127,12 +127,15 @@ def get_batted_balls_for_game(game_pk):
     for play in data.get("allPlays", []):
         matchup = play.get("matchup", {})
         batter = matchup.get("batter", {})
+        pitcher = matchup.get("pitcher", {})
         for event in play.get("playEvents", []):
             hit_data = event.get("hitData")
             if hit_data and hit_data.get("launchSpeed") is not None:
                 rows.append({
                     "playerId": batter.get("id"),
                     "playerName": batter.get("fullName"),
+                    "pitcherId": pitcher.get("id"),
+                    "pitcherName": pitcher.get("fullName"),
                     "launch_speed": hit_data.get("launchSpeed"),
                     "launch_angle": hit_data.get("launchAngle"),
                     "total_distance": hit_data.get("totalDistance"),
@@ -203,9 +206,92 @@ def add_pitching_derived(df):
 
 def zscore(series):
     s = pd.to_numeric(series, errors="coerce")
-    if s.dropna().empty or s.std(skipna=True) in (0, None):
-        return pd.Series([None] * len(series), index=series.index)
+    if s.dropna().empty or s.std(skipna=True) in (0, None) or pd.isna(s.std(skipna=True)):
+        return pd.Series([float("nan")] * len(series), index=series.index, dtype="float64")
     return (s - s.mean(skipna=True)) / s.std(skipna=True)
+
+
+def _row_mean_ignore_none(row, cols):
+    import numpy as np
+    vals = [row[c] for c in cols if c in row and pd.notna(row[c])]
+    return float(np.mean(vals)) if vals else None
+
+
+def compute_hitting_scores(df):
+    """Skill signal: plate discipline + age-for-level + (if available)
+    contact quality from Statcast (hard-hit%, barrel%, avg EV).
+    Results signal: what the stat line actually shows (AVG/OBP/SLG).
+    undervalued_score = skill_z - results_z -- positive means the
+    underlying indicators are better than the surface results suggest."""
+    if df.empty:
+        return df
+
+    df = df.copy()
+    # Skill components, z-scored within level so a young/disciplined
+    # Double-A guy is compared to Double-A peers, not Triple-A ones.
+    df["_z_BB_pct"] = df.groupby("level")["BB_pct"].transform(zscore)
+    df["_z_K_pct_inv"] = -df.groupby("level")["K_pct"].transform(zscore)
+    df["_z_age_inv"] = -df.groupby("level")["currentAge"].transform(zscore)
+
+    skill_cols = ["_z_BB_pct", "_z_K_pct_inv", "_z_age_inv"]
+
+    if "avg_exit_velocity" in df.columns:
+        df["_z_ev"] = df.groupby("level")["avg_exit_velocity"].transform(zscore)
+        df["_z_hard_hit"] = df.groupby("level")["hard_hit_pct"].transform(zscore)
+        df["_z_barrel"] = df.groupby("level")["barrel_pct_approx"].transform(zscore)
+        skill_cols += ["_z_ev", "_z_hard_hit", "_z_barrel"]
+
+    # Results: the actual triple-slash the stat line shows.
+    df["_z_avg"] = df.groupby("level")["avg"].transform(lambda s: zscore(pd.to_numeric(s, errors="coerce")))
+    df["_z_obp"] = df.groupby("level")["obp"].transform(lambda s: zscore(pd.to_numeric(s, errors="coerce")))
+    df["_z_slg"] = df.groupby("level")["slg"].transform(lambda s: zscore(pd.to_numeric(s, errors="coerce")))
+    results_cols = ["_z_avg", "_z_obp", "_z_slg"]
+
+    df["skill_z"] = df.apply(lambda r: _row_mean_ignore_none(r, skill_cols), axis=1)
+    df["results_z"] = df.apply(lambda r: _row_mean_ignore_none(r, results_cols), axis=1)
+    df["undervalued_score"] = df.apply(
+        lambda r: (r["skill_z"] - r["results_z"])
+        if r["skill_z"] is not None and r["results_z"] is not None else None,
+        axis=1)
+    df["has_statcast"] = "avg_exit_velocity" in df.columns and df["avg_exit_velocity"].notna()
+
+    df = df.drop(columns=[c for c in df.columns if c.startswith("_z_")])
+    return df
+
+
+def compute_pitching_scores(df):
+    """Skill signal: K-BB% + age-for-level + (if available) contact
+    quality ALLOWED from Statcast -- lower EV/hard-hit/barrel allowed is
+    better, so those are inverted before averaging in.
+    Results signal: ERA (inverted, since lower ERA = better results).
+    undervalued_score = skill_z - results_z."""
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df["_z_kbb"] = df.groupby("level")["K_minus_BB_pct"].transform(zscore)
+    df["_z_age_inv"] = -df.groupby("level")["currentAge"].transform(zscore)
+    skill_cols = ["_z_kbb", "_z_age_inv"]
+
+    if "avg_exit_velocity_allowed" in df.columns:
+        df["_z_ev_allowed_inv"] = -df.groupby("level")["avg_exit_velocity_allowed"].transform(zscore)
+        df["_z_hard_hit_allowed_inv"] = -df.groupby("level")["hard_hit_pct_allowed"].transform(zscore)
+        df["_z_barrel_allowed_inv"] = -df.groupby("level")["barrel_pct_approx_allowed"].transform(zscore)
+        skill_cols += ["_z_ev_allowed_inv", "_z_hard_hit_allowed_inv", "_z_barrel_allowed_inv"]
+
+    df["_z_era_inv"] = -df.groupby("level")["era"].transform(lambda s: zscore(pd.to_numeric(s, errors="coerce")))
+    results_cols = ["_z_era_inv"]
+
+    df["skill_z"] = df.apply(lambda r: _row_mean_ignore_none(r, skill_cols), axis=1)
+    df["results_z"] = df.apply(lambda r: _row_mean_ignore_none(r, results_cols), axis=1)
+    df["undervalued_score"] = df.apply(
+        lambda r: (r["skill_z"] - r["results_z"])
+        if r["skill_z"] is not None and r["results_z"] is not None else None,
+        axis=1)
+    df["has_statcast"] = "avg_exit_velocity_allowed" in df.columns and df["avg_exit_velocity_allowed"].notna()
+
+    df = df.drop(columns=[c for c in df.columns if c.startswith("_z_")])
+    return df
 
 
 def approx_barrel(row):
@@ -221,10 +307,14 @@ def approx_barrel(row):
     return False
 
 
-def summarize_statcast(raw_df):
+def summarize_statcast(raw_df, id_col="playerId", name_col="playerName", suffix=""):
+    """id_col/name_col let this summarize either the batter's own contact
+    (playerId/playerName) or the pitcher's contact ALLOWED (pitcherId/
+    pitcherName) from the same raw batted-ball rows. suffix distinguishes
+    the resulting column names (e.g. '_allowed' for pitchers)."""
     if raw_df is None or raw_df.empty or "launch_speed" not in raw_df.columns:
         return pd.DataFrame()
-    bb = raw_df.dropna(subset=["launch_speed"])
+    bb = raw_df.dropna(subset=["launch_speed", id_col])
     if bb.empty:
         return pd.DataFrame()
     bb = bb.copy()
@@ -234,15 +324,17 @@ def summarize_statcast(raw_df):
         n = len(g)
         hard_hit = (g["launch_speed"] >= 95).sum()
         return pd.Series({
-            "statcast_BBE": n,
-            "avg_exit_velocity": g["launch_speed"].mean(),
-            "max_exit_velocity": g["launch_speed"].max(),
-            "avg_launch_angle": g["launch_angle"].mean(),
-            "hard_hit_pct": hard_hit / n if n else None,
-            "barrel_pct_approx": g["is_barrel"].sum() / n if n else None,
+            f"statcast_BBE{suffix}": n,
+            f"avg_exit_velocity{suffix}": g["launch_speed"].mean(),
+            f"max_exit_velocity{suffix}": g["launch_speed"].max(),
+            f"avg_launch_angle{suffix}": g["launch_angle"].mean(),
+            f"hard_hit_pct{suffix}": hard_hit / n if n else None,
+            f"barrel_pct_approx{suffix}": g["is_barrel"].sum() / n if n else None,
         })
 
-    return bb.groupby("playerId").apply(player_agg).reset_index()
+    summary = bb.groupby(id_col).apply(player_agg).reset_index()
+    summary = summary.rename(columns={id_col: "playerId"})
+    return summary
 
 
 def merge_statcast(df, statcast_summary):
@@ -311,53 +403,47 @@ def build_full(season, progress_callback=None):
     if not hitting.empty:
         hitting = hitting.merge(bio_df, on="playerId", how="left")
         hitting = add_hitting_derived(hitting)
-        hitting["age_vs_level_z"] = hitting.groupby("level")["currentAge"].transform(zscore)
-        hitting["BABIP_z_in_level"] = hitting.groupby("level")["BABIP"].transform(zscore)
-        hitting["K_pct_z_in_level"] = hitting.groupby("level")["K_pct"].transform(zscore)
-        hitting["BB_pct_z_in_level"] = hitting.groupby("level")["BB_pct"].transform(zscore)
-        hitting["undervalued_score"] = (
-            -hitting["age_vs_level_z"].fillna(0)
-            + hitting["BB_pct_z_in_level"].fillna(0)
-            - hitting["K_pct_z_in_level"].fillna(0)
-            - hitting["BABIP_z_in_level"].fillna(0)
-        )
 
     if not pitching.empty:
         pitching = pitching.merge(bio_df, on="playerId", how="left")
         pitching = add_pitching_derived(pitching)
-        pitching["age_vs_level_z"] = pitching.groupby("level")["currentAge"].transform(zscore)
-        pitching["K_minus_BB_z_in_level"] = pitching.groupby("level")["K_minus_BB_pct"].transform(zscore)
-        pitching["ERA_z_in_level"] = pitching.groupby("level")["era"].transform(
-            lambda s: zscore(pd.to_numeric(s, errors="coerce")))
-        pitching["undervalued_score"] = (
-            -pitching["age_vs_level_z"].fillna(0)
-            + pitching["K_minus_BB_z_in_level"].fillna(0)
-            + pitching["ERA_z_in_level"].fillna(0)
-        )
 
     # Statcast for tracked levels only -- happens automatically, no second
-    # button/step needed.
+    # button/step needed. Pulls batted-ball data once per team, then
+    # summarizes it BOTH from the batter's side (their own contact) and
+    # the pitcher's side (contact allowed).
     tracked_teams = [t for t in teams if t["levelName"] in STATCAST_TRACKED_LEVELS]
-    if tracked_teams and not hitting.empty:
-        all_summaries = []
+    if tracked_teams:
+        batter_summaries, pitcher_summaries = [], []
         n_tracked = len(tracked_teams)
         for i, t in enumerate(tracked_teams):
             base_pct = 0.6 + (i / n_tracked) * 0.38
 
-            def cb(msg, base_pct=base_pct, n_tracked=n_tracked):
+            def cb(msg, base_pct=base_pct):
                 report(base_pct, f"Statcast: {msg}")
 
             raw = pull_statcast_for_team(t["teamId"], t["sportId"], season,
                                           progress_callback=cb, label=t["teamName"])
-            summary = summarize_statcast(raw)
-            if not summary.empty:
-                all_summaries.append(summary)
+            b_summary = summarize_statcast(raw, id_col="playerId", name_col="playerName")
+            if not b_summary.empty:
+                batter_summaries.append(b_summary)
+            p_summary = summarize_statcast(raw, id_col="pitcherId", name_col="pitcherName", suffix="_allowed")
+            if not p_summary.empty:
+                pitcher_summaries.append(p_summary)
 
-        if all_summaries:
-            combined = pd.concat(all_summaries, ignore_index=True)
-            # if a player appears in both tracked levels somehow, keep first
-            combined = combined.drop_duplicates(subset=["playerId"])
+        if batter_summaries and not hitting.empty:
+            combined = pd.concat(batter_summaries, ignore_index=True).drop_duplicates(subset=["playerId"])
             hitting = merge_statcast(hitting, combined)
+        if pitcher_summaries and not pitching.empty:
+            combined = pd.concat(pitcher_summaries, ignore_index=True).drop_duplicates(subset=["playerId"])
+            pitching = merge_statcast(pitching, combined)
+
+    # Now compute scores -- after Statcast is merged in, so the score
+    # function can detect and use it when present.
+    if not hitting.empty:
+        hitting = compute_hitting_scores(hitting)
+    if not pitching.empty:
+        pitching = compute_pitching_scores(pitching)
 
     report(1.0, "Done.")
     return hitting, pitching, teams
