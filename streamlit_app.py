@@ -55,9 +55,9 @@ if st.button("🔄 Pull now (box score + Statcast, all in one step)", type="prim
         progress_bar.progress(min(max(pct, 0.0), 1.0))
         status.text(msg)
 
-    with st.spinner("Working... this can take a few minutes (Statcast pulls are per-game)."):
-        hitting, pitching, teams = build_full(int(season), progress_callback)
-        excel_bytes = write_excel_bytes(hitting, pitching, teams)
+    with st.spinner("Working... this can take a while (pitch + batted-ball data is pulled game by game, for every level)."):
+        hitting, pitching, arsenal, teams = build_full(int(season), progress_callback)
+        excel_bytes = write_excel_bytes(hitting, pitching, teams, arsenal)
 
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(EXCEL_PATH, "wb") as f:
@@ -67,13 +67,15 @@ if st.button("🔄 Pull now (box score + Statcast, all in one step)", type="prim
 
     st.session_state["hitting"] = hitting
     st.session_state["pitching"] = pitching
+    st.session_state["arsenal"] = arsenal
     status.text("Done.")
-    st.success(f"Pulled {len(hitting)} hitter-rows and {len(pitching)} pitcher-rows.")
+    st.success(f"Pulled {len(hitting)} hitter-rows, {len(pitching)} pitcher-rows, {len(arsenal)} arsenal rows.")
     st.rerun()
 
 # --- Load dataframes (from this session's pull, or from the saved file) ---
 hitting = st.session_state.get("hitting")
 pitching = st.session_state.get("pitching")
+arsenal = st.session_state.get("arsenal")
 
 if (hitting is None or pitching is None) and os.path.exists(EXCEL_PATH):
     try:
@@ -82,8 +84,11 @@ if (hitting is None or pitching is None) and os.path.exists(EXCEL_PATH):
             hitting = pd.read_excel(xl, "Hitting - All Levels")
         if "Pitching - All Levels" in xl.sheet_names:
             pitching = pd.read_excel(xl, "Pitching - All Levels")
+        if "Pitch Arsenal" in xl.sheet_names:
+            arsenal = pd.read_excel(xl, "Pitch Arsenal")
         st.session_state["hitting"] = hitting
         st.session_state["pitching"] = pitching
+        st.session_state["arsenal"] = arsenal
     except Exception as e:
         st.error(f"Couldn't load saved data: {e}")
 
@@ -144,6 +149,22 @@ if is_hitter:
     else:
         st.caption("No Statcast available at this level (only Triple-A and Single-A are publicly tracked).")
 
+    st.markdown("**Scouting grades (20-80 scale)**")
+    st.caption(
+        "Hit/Power are stat-derived with reasonable confidence. Field uses "
+        "box-score fielding only (no OAA-equivalent exists for minors) -- "
+        "low-medium confidence. Run uses stolen-base rate only, since no "
+        "public sprint speed exists for minors -- low confidence. Arm has "
+        "zero public data anywhere and is left blank rather than guessed."
+    )
+    g1, g2, g3, g4, g5, g6 = st.columns(6)
+    g1.metric("Hit", row.get("hit_grade") if pd.notna(row.get("hit_grade")) else "-")
+    g2.metric("Power", row.get("power_grade") if pd.notna(row.get("power_grade")) else "-")
+    g3.metric("Field", row.get("field_grade") if pd.notna(row.get("field_grade")) else "-")
+    g4.metric("Run", row.get("run_grade") if pd.notna(row.get("run_grade")) else "-")
+    g5.metric("Arm", "N/A")
+    g6.metric("Overall FV", row.get("overall_fv") if pd.notna(row.get("overall_fv")) else "-")
+
     st.markdown("**Skill vs. Results**")
     skill_z = row.get("skill_z")
     results_z = row.get("results_z")
@@ -186,7 +207,36 @@ elif is_pitcher:
         s2.metric("Hard-Hit% Allowed", f"{row.get('hard_hit_pct_allowed', 0):.1%}" if pd.notna(row.get("hard_hit_pct_allowed")) else "-")
         s3.metric("Barrel% Allowed (approx)", f"{row.get('barrel_pct_approx_allowed', 0):.1%}" if pd.notna(row.get("barrel_pct_approx_allowed")) else "-")
     else:
-        st.caption("No Statcast available at this level (only Triple-A and Single-A are publicly tracked).")
+        st.caption("No batted-ball Statcast available at this level.")
+
+    st.markdown("**Pitch arsenal**")
+    if arsenal is not None and not arsenal.empty and "playerId" in row.index:
+        pid = row.get("playerId")
+        pitcher_arsenal = arsenal[arsenal["pitcherId"] == pid] if "pitcherId" in arsenal.columns else pd.DataFrame()
+        if not pitcher_arsenal.empty:
+            display_cols = ["pitch_type", "usage_pct", "avg_velo", "max_velo",
+                             "avg_spin_rate", "avg_horiz_break_in", "avg_vert_break_in", "whiff_pct"]
+            display_cols = [c for c in display_cols if c in pitcher_arsenal.columns]
+            st.dataframe(
+                pitcher_arsenal[display_cols].sort_values("usage_pct", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
+            if pitcher_arsenal["avg_spin_rate"].isna().all():
+                st.caption("No spin-rate tracking at this level (velocity/movement may still be tracked).")
+        else:
+            st.caption("No pitch-tracking data available for this pitcher.")
+    else:
+        st.caption("No pitch-tracking data available.")
+
+    st.markdown("**Scouting grades (20-80 scale)**")
+    st.caption(
+        f"Control: {row.get('control_grade_confidence', 'n/a')}. "
+        f"Stuff: {row.get('stuff_grade_confidence', 'n/a')}."
+    )
+    g1, g2, g3 = st.columns(3)
+    g1.metric("Control", row.get("control_grade") if pd.notna(row.get("control_grade")) else "-")
+    g2.metric("Stuff", row.get("stuff_grade") if pd.notna(row.get("stuff_grade")) else "-")
+    g3.metric("Overall FV", row.get("pitching_overall_fv") if pd.notna(row.get("pitching_overall_fv")) else "-")
 
     st.markdown("**Skill vs. Results**")
     skill_z = row.get("skill_z")
