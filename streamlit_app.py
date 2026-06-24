@@ -158,6 +158,88 @@ def add_pitching_derived(df):
     return df
 
 
+# ---------------------------------------------------------------------------
+# Statcast (minors) — ONLY publicly tracked for:
+#   - Triple-A (all teams) since 2023
+#   - Florida State League / Single-A since 2021
+# Everything else (Double-A, High-A, Rookie, DSL) has no public Statcast,
+# full stop -- there is no workaround for that, so those levels will only
+# ever have the box-score-derived stats above.
+#
+# There is no officially documented CSV export endpoint for the minors
+# search tool (unlike the MLB search, which has a known /csv endpoint).
+# This function makes a best-effort attempt at a CSV pull using the same
+# URL pattern Savant uses for the MLB search tool, pointed at the minors
+# dataset. If that fails (it may -- this is undocumented and could break
+# at any time), the Streamlit UI below lets you manually export a CSV from
+# https://baseballsavant.mlb.com/statcast-search-minors yourself (there's
+# a CSV download icon on that page's results table) and upload it, and
+# the app will merge it in exactly the same way.
+# ---------------------------------------------------------------------------
+
+STATCAST_TRACKED_LEVELS = {"Triple-A", "Single-A"}  # only these get a shot at Statcast
+
+
+def try_fetch_statcast_minors_csv(season, team_abbrev="NYM"):
+    """Best-effort automated pull. Returns a DataFrame or None if it fails."""
+    url = "https://baseballsavant.mlb.com/statcast_search_minors/csv"
+    params = {
+        "hfSea": f"{season}|",
+        "team": team_abbrev,
+        "player_type": "batter",
+        "type": "details",
+        "all": "true",
+    }
+    try:
+        r = SESSION.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        if df.empty or "player_name" not in df.columns:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+def summarize_statcast(raw_df):
+    """Collapse pitch/batted-ball-level Statcast rows into one row per
+    player with headline metrics: EV, barrel%, hard-hit%, xwOBA, etc."""
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+
+    if "launch_speed" not in raw_df.columns:
+        return pd.DataFrame()
+    bb = raw_df.dropna(subset=["launch_speed"])
+    if bb.empty:
+        return pd.DataFrame()
+
+    def player_agg(g):
+        n = len(g)
+        hard_hit = (g["launch_speed"] >= 95).sum()
+        barrels = g["barrel"].sum() if "barrel" in g.columns else None
+        return pd.Series({
+            "statcast_BBE": n,
+            "avg_exit_velocity": g["launch_speed"].mean(),
+            "max_exit_velocity": g["launch_speed"].max(),
+            "avg_launch_angle": g["launch_angle"].mean() if "launch_angle" in g.columns else None,
+            "hard_hit_pct": hard_hit / n if n else None,
+            "barrel_pct": (barrels / n) if barrels is not None and n else None,
+            "xwOBA": g["estimated_woba_using_speedangle"].mean() if "estimated_woba_using_speedangle" in g.columns else None,
+            "xBA": g["estimated_ba_using_speedangle"].mean() if "estimated_ba_using_speedangle" in g.columns else None,
+        })
+
+    group_col = "player_name" if "player_name" in bb.columns else "batter"
+    summary = bb.groupby(group_col).apply(player_agg).reset_index()
+    summary = summary.rename(columns={group_col: "playerName"})
+    return summary
+
+
+def merge_statcast(df, statcast_summary):
+    if df.empty or statcast_summary is None or statcast_summary.empty:
+        return df
+    return df.merge(statcast_summary, on="playerName", how="left", suffixes=("", "_sc"))
+
+
 def zscore(series):
     s = pd.to_numeric(series, errors="coerce")
     if s.dropna().empty or s.std(skipna=True) in (0, None):
@@ -337,13 +419,11 @@ if st.button("Pull data", type="primary"):
 
     with st.spinner("Working..."):
         hitting, pitching, teams = build(int(season), progress_callback)
-        excel_bytes = write_excel_bytes(hitting, pitching, teams)
 
     st.session_state.result = {
         "hitting": hitting,
         "pitching": pitching,
         "teams": teams,
-        "excel_bytes": excel_bytes,
     }
     status.text("Done.")
 
@@ -351,9 +431,52 @@ if st.session_state.result:
     res = st.session_state.result
     st.success(f"Pulled {len(res['hitting'])} hitter-rows and {len(res['pitching'])} pitcher-rows across {len(res['teams'])} teams.")
 
+    st.divider()
+    st.subheader("Statcast (Triple-A & Single-A only)")
+    st.caption(
+        "Public Statcast tracking for the minors is ONLY available for Triple-A "
+        "(Syracuse) since 2023 and the Florida State League / Single-A (St. Lucie) "
+        "since 2021. Double-A, High-A, Rookie, and DSL have no public Statcast — "
+        "that's a real data gap, not a script limitation. There's no documented "
+        "export API for the minors Statcast tool, so this app tries an automated "
+        "pull first; if that fails, export a CSV yourself from "
+        "https://baseballsavant.mlb.com/statcast-search-minors (filter to NYM, "
+        "your season, batter or pitcher) and upload it below."
+    )
+
+    if st.button("Try automated Statcast pull"):
+        with st.spinner("Attempting automated Statcast pull (may fail -- undocumented endpoint)..."):
+            raw = try_fetch_statcast_minors_csv(int(season))
+            summary = summarize_statcast(raw)
+        if summary.empty:
+            st.warning("Automated pull didn't return usable data. Use the manual upload below instead.")
+        else:
+            res["hitting"] = merge_statcast(res["hitting"], summary)
+            st.session_state.result = res
+            st.success(f"Merged Statcast data for {len(summary)} players.")
+
+    uploaded = st.file_uploader(
+        "Or upload a manually-exported Statcast CSV (from the minors search page)",
+        type="csv",
+    )
+    if uploaded is not None:
+        try:
+            raw = pd.read_csv(uploaded)
+            summary = summarize_statcast(raw)
+            if summary.empty:
+                st.warning("Couldn't find expected Statcast columns (launch_speed, etc.) in that file.")
+            else:
+                res["hitting"] = merge_statcast(res["hitting"], summary)
+                st.session_state.result = res
+                st.success(f"Merged Statcast data for {len(summary)} players from your upload.")
+        except Exception as e:
+            st.error(f"Couldn't read that file: {e}")
+
+    st.divider()
+    excel_bytes = write_excel_bytes(res["hitting"], res["pitching"], res["teams"])
     st.download_button(
         label="📥 Download Excel workbook",
-        data=res["excel_bytes"],
+        data=excel_bytes,
         file_name=f"mets_milb_{season}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
