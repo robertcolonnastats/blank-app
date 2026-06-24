@@ -26,8 +26,8 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    hitting, pitching, teams = build_full(args.season)
-    excel_bytes = write_excel_bytes(hitting, pitching, teams)
+    hitting, pitching, arsenal, teams = build_full(args.season)
+    excel_bytes = write_excel_bytes(hitting, pitching, teams, arsenal)
 
     out_path = os.path.join(args.out_dir, "mets_milb_latest.xlsx")
     with open(out_path, "wb") as f:
@@ -40,6 +40,7 @@ def main():
     print(f"Saved {out_path}")
     print(f"  Hitting rows: {len(hitting)}")
     print(f"  Pitching rows: {len(pitching)}")
+    print(f"  Arsenal rows: {len(arsenal)}")
 
 
 if __name__ == "__main__":
