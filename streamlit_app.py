@@ -245,27 +245,53 @@ def build(season, progress_callback=None):
     return hitting, pitching, teams
 
 
+INVALID_SHEET_CHARS = ['\\', '/', '?', '*', '[', ']', ':']
+
+
+def safe_sheet_name(name, used_names):
+    cleaned = name
+    for ch in INVALID_SHEET_CHARS:
+        cleaned = cleaned.replace(ch, "-")
+    cleaned = cleaned.strip().strip("'")
+    if not cleaned:
+        cleaned = "Sheet"
+    cleaned = cleaned[:31]
+    base = cleaned
+    suffix = 1
+    while cleaned.lower() in used_names:
+        suffix_str = f"_{suffix}"
+        cleaned = (base[: 31 - len(suffix_str)] + suffix_str)
+        suffix += 1
+    used_names.add(cleaned.lower())
+    return cleaned
+
+
 def write_excel_bytes(hitting, pitching, teams):
     level_order = list(dict.fromkeys(t["levelName"] for t in teams))
     buffer = io.BytesIO()
+    used_names = set()
 
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         if not hitting.empty:
+            name = safe_sheet_name("Hitting - All Levels", used_names)
             hitting.sort_values("undervalued_score", ascending=False).to_excel(
-                writer, sheet_name="Hitting - All Levels", index=False)
+                writer, sheet_name=name, index=False)
         if not pitching.empty:
+            name = safe_sheet_name("Pitching - All Levels", used_names)
             pitching.sort_values("undervalued_score", ascending=False).to_excel(
-                writer, sheet_name="Pitching - All Levels", index=False)
+                writer, sheet_name=name, index=False)
 
         for level in level_order:
             if not hitting.empty:
                 sub = hitting[hitting["level"] == level].sort_values("undervalued_score", ascending=False)
                 if not sub.empty:
-                    sub.to_excel(writer, sheet_name=f"Hit-{level}"[:31], index=False)
+                    name = safe_sheet_name(f"Hit-{level}", used_names)
+                    sub.to_excel(writer, sheet_name=name, index=False)
             if not pitching.empty:
                 sub = pitching[pitching["level"] == level].sort_values("undervalued_score", ascending=False)
                 if not sub.empty:
-                    sub.to_excel(writer, sheet_name=f"Pitch-{level}"[:31], index=False)
+                    name = safe_sheet_name(f"Pitch-{level}", used_names)
+                    sub.to_excel(writer, sheet_name=name, index=False)
 
     buffer.seek(0)
     wb = load_workbook(buffer)
