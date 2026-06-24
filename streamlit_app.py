@@ -159,85 +159,121 @@ def add_pitching_derived(df):
 
 
 # ---------------------------------------------------------------------------
-# Statcast (minors) — ONLY publicly tracked for:
-#   - Triple-A (all teams) since 2023
-#   - Florida State League / Single-A since 2021
-# Everything else (Double-A, High-A, Rookie, DSL) has no public Statcast,
-# full stop -- there is no workaround for that, so those levels will only
-# ever have the box-score-derived stats above.
+# Statcast (minors) via MLB Stats API play-by-play feed
 #
-# There is no officially documented CSV export endpoint for the minors
-# search tool (unlike the MLB search, which has a known /csv endpoint).
-# This function makes a best-effort attempt at a CSV pull using the same
-# URL pattern Savant uses for the MLB search tool, pointed at the minors
-# dataset. If that fails (it may -- this is undocumented and could break
-# at any time), the Streamlit UI below lets you manually export a CSV from
-# https://baseballsavant.mlb.com/statcast-search-minors yourself (there's
-# a CSV download icon on that page's results table) and upload it, and
-# the app will merge it in exactly the same way.
+# Public Statcast tracking only exists for Triple-A (since 2023) and the
+# Florida State League / Single-A (since 2021). For games at those levels,
+# the MLB Stats API's own play-by-play feed includes a "hitData" block on
+# batted-ball events with launchSpeed / launchAngle / totalDistance -- this
+# is the same underlying tracking data, exposed through the documented,
+# reliable Stats API instead of an undocumented Savant CSV endpoint.
+#
+# This pulls every regular-season game for the given team, fetches play-by-
+# play for each, and aggregates batted-ball metrics per player. It's more
+# API calls than the season-stat endpoints (one per game), so it's slower,
+# but it doesn't depend on guessing at an unstable scraping target.
 # ---------------------------------------------------------------------------
 
-STATCAST_TRACKED_LEVELS = {"Triple-A", "Single-A"}  # only these get a shot at Statcast
+STATCAST_TRACKED_LEVELS = {"Triple-A", "Single-A"}
 
 
-def try_fetch_statcast_minors_csv(season, team_abbrev="NYM"):
-    """Best-effort automated pull. Returns a DataFrame or None if it fails."""
-    url = "https://baseballsavant.mlb.com/statcast_search_minors/csv"
-    params = {
-        "hfSea": f"{season}|",
-        "team": team_abbrev,
-        "player_type": "batter",
-        "type": "details",
-        "all": "true",
-    }
-    try:
-        r = SESSION.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text))
-        if df.empty or "player_name" not in df.columns:
-            return None
-        return df
-    except Exception:
-        return None
+def get_team_game_pks(team_id, sport_id, season):
+    data = get_json(f"{BASE}/schedule", params={
+        "teamId": team_id,
+        "sportId": sport_id,
+        "season": season,
+        "gameType": "R",
+    })
+    pks = []
+    for date_block in data.get("dates", []):
+        for game in date_block.get("games", []):
+            if game.get("status", {}).get("abstractGameState") == "Final":
+                pks.append(game["gamePk"])
+    return pks
+
+
+def get_batted_balls_for_game(game_pk):
+    """Returns list of dicts: playerId, playerName, launchSpeed, launchAngle,
+    totalDistance for every tracked batted ball in this game."""
+    data = get_json(f"{BASE}/game/{game_pk}/playByPlay")
+    rows = []
+    for play in data.get("allPlays", []):
+        matchup = play.get("matchup", {})
+        batter = matchup.get("batter", {})
+        for event in play.get("playEvents", []):
+            hit_data = event.get("hitData")
+            if hit_data and hit_data.get("launchSpeed") is not None:
+                rows.append({
+                    "playerId": batter.get("id"),
+                    "playerName": batter.get("fullName"),
+                    "launch_speed": hit_data.get("launchSpeed"),
+                    "launch_angle": hit_data.get("launchAngle"),
+                    "total_distance": hit_data.get("totalDistance"),
+                })
+    return rows
+
+
+def pull_statcast_for_team(team_id, sport_id, season, progress_callback=None, label=""):
+    game_pks = get_team_game_pks(team_id, sport_id, season)
+    all_rows = []
+    for i, pk in enumerate(game_pks):
+        if progress_callback and i % 5 == 0:
+            progress_callback(f"{label}: game {i+1}/{len(game_pks)}...")
+        all_rows.extend(get_batted_balls_for_game(pk))
+        time.sleep(0.1)
+    return pd.DataFrame(all_rows)
 
 
 def summarize_statcast(raw_df):
-    """Collapse pitch/batted-ball-level Statcast rows into one row per
-    player with headline metrics: EV, barrel%, hard-hit%, xwOBA, etc."""
-    if raw_df is None or raw_df.empty:
+    """Collapse batted-ball-level rows into one row per player with
+    headline metrics: EV, hard-hit%, approx barrel%, etc."""
+    if raw_df is None or raw_df.empty or "launch_speed" not in raw_df.columns:
         return pd.DataFrame()
 
-    if "launch_speed" not in raw_df.columns:
-        return pd.DataFrame()
     bb = raw_df.dropna(subset=["launch_speed"])
     if bb.empty:
         return pd.DataFrame()
 
+    def approx_barrel(row):
+        # Simplified barrel approximation (real Savant barrel classification
+        # uses a speed/angle matrix; this is a reasonable stand-in since the
+        # exact matrix isn't publicly documented in closed form).
+        ev = row["launch_speed"]
+        la = row["launch_angle"]
+        if pd.isna(ev) or pd.isna(la):
+            return False
+        if ev >= 98 and 26 <= la <= 30:
+            return True
+        if ev > 98:
+            # widen angle window slightly as EV climbs, mirroring Savant's
+            # real barrel definition shape
+            extra = min((ev - 98) * 0.5, 10)
+            return (26 - extra) <= la <= (30 + extra)
+        return False
+
+    bb = bb.copy()
+    bb["is_barrel"] = bb.apply(approx_barrel, axis=1)
+
     def player_agg(g):
         n = len(g)
         hard_hit = (g["launch_speed"] >= 95).sum()
-        barrels = g["barrel"].sum() if "barrel" in g.columns else None
         return pd.Series({
             "statcast_BBE": n,
             "avg_exit_velocity": g["launch_speed"].mean(),
             "max_exit_velocity": g["launch_speed"].max(),
-            "avg_launch_angle": g["launch_angle"].mean() if "launch_angle" in g.columns else None,
+            "avg_launch_angle": g["launch_angle"].mean(),
             "hard_hit_pct": hard_hit / n if n else None,
-            "barrel_pct": (barrels / n) if barrels is not None and n else None,
-            "xwOBA": g["estimated_woba_using_speedangle"].mean() if "estimated_woba_using_speedangle" in g.columns else None,
-            "xBA": g["estimated_ba_using_speedangle"].mean() if "estimated_ba_using_speedangle" in g.columns else None,
+            "barrel_pct_approx": g["is_barrel"].sum() / n if n else None,
         })
 
-    group_col = "player_name" if "player_name" in bb.columns else "batter"
-    summary = bb.groupby(group_col).apply(player_agg).reset_index()
-    summary = summary.rename(columns={group_col: "playerName"})
+    summary = bb.groupby("playerId").apply(player_agg).reset_index()
     return summary
 
 
 def merge_statcast(df, statcast_summary):
     if df.empty or statcast_summary is None or statcast_summary.empty:
         return df
-    return df.merge(statcast_summary, on="playerName", how="left", suffixes=("", "_sc"))
+    return df.merge(statcast_summary, on="playerId", how="left", suffixes=("", "_sc"))
 
 
 def zscore(series):
@@ -434,43 +470,49 @@ if st.session_state.result:
     st.divider()
     st.subheader("Statcast (Triple-A & Single-A only)")
     st.caption(
-        "Public Statcast tracking for the minors is ONLY available for Triple-A "
-        "(Syracuse) since 2023 and the Florida State League / Single-A (St. Lucie) "
-        "since 2021. Double-A, High-A, Rookie, and DSL have no public Statcast — "
-        "that's a real data gap, not a script limitation. There's no documented "
-        "export API for the minors Statcast tool, so this app tries an automated "
-        "pull first; if that fails, export a CSV yourself from "
-        "https://baseballsavant.mlb.com/statcast-search-minors (filter to NYM, "
-        "your season, batter or pitcher) and upload it below."
+        "Public Statcast tracking for the minors only exists for Triple-A "
+        "(Syracuse) since 2023 and the Florida State League / Single-A "
+        "(St. Lucie) since 2021. Double-A, High-A, Rookie, and DSL have no "
+        "public Statcast anywhere -- that's a real data gap. This pulls "
+        "exit velocity / launch angle / hard-hit% directly from the MLB "
+        "Stats API's game-by-game play-by-play feed (the same documented "
+        "API used above), aggregated per player. It's slow because it "
+        "fetches every game individually -- expect a few minutes."
     )
 
-    if st.button("Try automated Statcast pull"):
-        with st.spinner("Attempting automated Statcast pull (may fail -- undocumented endpoint)..."):
-            raw = try_fetch_statcast_minors_csv(int(season))
-            summary = summarize_statcast(raw)
-        if summary.empty:
-            st.warning("Automated pull didn't return usable data. Use the manual upload below instead.")
+    if st.button("Pull Statcast (Syracuse + St. Lucie)"):
+        tracked_teams = [t for t in res["teams"] if t["levelName"] in STATCAST_TRACKED_LEVELS]
+        if not tracked_teams:
+            st.warning("No Triple-A or Single-A team found in the pulled data.")
         else:
-            res["hitting"] = merge_statcast(res["hitting"], summary)
-            st.session_state.result = res
-            st.success(f"Merged Statcast data for {len(summary)} players.")
+            sc_progress = st.progress(0.0)
+            sc_status = st.empty()
+            all_summaries = []
+            for i, t in enumerate(tracked_teams):
+                def cb(msg):
+                    sc_status.text(msg)
+                with st.spinner(f"Pulling Statcast for {t['teamName']}..."):
+                    raw = pull_statcast_for_team(
+                        t["teamId"], t["sportId"], int(season),
+                        progress_callback=cb, label=t["teamName"])
+                    summary = summarize_statcast(raw)
+                    summary["level"] = t["levelName"]
+                    all_summaries.append(summary)
+                sc_progress.progress((i + 1) / len(tracked_teams))
 
-    uploaded = st.file_uploader(
-        "Or upload a manually-exported Statcast CSV (from the minors search page)",
-        type="csv",
-    )
-    if uploaded is not None:
-        try:
-            raw = pd.read_csv(uploaded)
-            summary = summarize_statcast(raw)
-            if summary.empty:
-                st.warning("Couldn't find expected Statcast columns (launch_speed, etc.) in that file.")
+            combined_summary = pd.concat(all_summaries, ignore_index=True) if all_summaries else pd.DataFrame()
+            if combined_summary.empty:
+                st.warning(
+                    "No batted-ball tracking data came back for these games. "
+                    "This can happen if a level's tracking coverage changed "
+                    "or games aren't fully loaded yet -- try again later in "
+                    "the season, or double check the season year."
+                )
             else:
-                res["hitting"] = merge_statcast(res["hitting"], summary)
+                res["hitting"] = merge_statcast(res["hitting"], combined_summary.drop(columns=["level"]))
                 st.session_state.result = res
-                st.success(f"Merged Statcast data for {len(summary)} players from your upload.")
-        except Exception as e:
-            st.error(f"Couldn't read that file: {e}")
+                sc_status.text("Done.")
+                st.success(f"Merged Statcast data for {len(combined_summary)} players.")
 
     st.divider()
     excel_bytes = write_excel_bytes(res["hitting"], res["pitching"], res["teams"])
