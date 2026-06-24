@@ -23,6 +23,18 @@ import streamlit as st
 
 from mets_milb_lib import build_full, write_excel_bytes
 
+
+def fmt(value, spec, suffix=""):
+    """MLB's API sometimes returns numeric stats (avg/obp/slg, etc.) as
+    strings like '.267'. This safely coerces to float before formatting,
+    instead of letting the f-string format spec choke on a str."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "-"
+    try:
+        return f"{float(value):{spec}}{suffix}"
+    except (TypeError, ValueError):
+        return "-"
+
 DATA_DIR = "data"
 EXCEL_PATH = os.path.join(DATA_DIR, "mets_milb_latest.xlsx")
 TIMESTAMP_PATH = os.path.join(DATA_DIR, "last_updated.txt")
@@ -133,19 +145,19 @@ if is_hitter:
 
     st.markdown("**Stat line**")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("AVG", f"{row.get('avg', 0):.3f}" if pd.notna(row.get("avg")) else "-")
-    c2.metric("OBP", f"{row.get('obp', 0):.3f}" if pd.notna(row.get("obp")) else "-")
-    c3.metric("SLG", f"{row.get('slg', 0):.3f}" if pd.notna(row.get("slg")) else "-")
-    c4.metric("BB%", f"{row.get('BB_pct', 0):.1%}" if pd.notna(row.get("BB_pct")) else "-")
-    c5.metric("K%", f"{row.get('K_pct', 0):.1%}" if pd.notna(row.get("K_pct")) else "-")
+    c1.metric("AVG", fmt(row.get("avg"), ".3f", ""))
+    c2.metric("OBP", fmt(row.get("obp"), ".3f", ""))
+    c3.metric("SLG", fmt(row.get("slg"), ".3f", ""))
+    c4.metric("BB%", fmt(row.get("BB_pct"), ".1%", ""))
+    c5.metric("K%", fmt(row.get("K_pct"), ".1%", ""))
 
     if row.get("has_statcast"):
         st.markdown("**Statcast (this level is publicly tracked)**")
         s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Avg Exit Velo", f"{row.get('avg_exit_velocity', 0):.1f} mph")
-        s2.metric("Max Exit Velo", f"{row.get('max_exit_velocity', 0):.1f} mph")
-        s3.metric("Hard-Hit%", f"{row.get('hard_hit_pct', 0):.1%}" if pd.notna(row.get("hard_hit_pct")) else "-")
-        s4.metric("Barrel% (approx)", f"{row.get('barrel_pct_approx', 0):.1%}" if pd.notna(row.get("barrel_pct_approx")) else "-")
+        s1.metric("Avg Exit Velo", fmt(row.get("avg_exit_velocity"), ".1f", " mph"))
+        s2.metric("Max Exit Velo", fmt(row.get("max_exit_velocity"), ".1f", " mph"))
+        s3.metric("Hard-Hit%", fmt(row.get("hard_hit_pct"), ".1%", ""))
+        s4.metric("Barrel% (approx)", fmt(row.get("barrel_pct_approx"), ".1%", ""))
     else:
         st.caption("No Statcast available at this level (only Triple-A and Single-A are publicly tracked).")
 
@@ -197,15 +209,15 @@ elif is_pitcher:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("ERA", f"{row.get('era', '-')}")
     c2.metric("WHIP", f"{row.get('whip', '-')}")
-    c3.metric("K%", f"{row.get('K_pct', 0):.1%}" if pd.notna(row.get("K_pct")) else "-")
-    c4.metric("K-BB%", f"{row.get('K_minus_BB_pct', 0):.1%}" if pd.notna(row.get("K_minus_BB_pct")) else "-")
+    c3.metric("K%", fmt(row.get("K_pct"), ".1%", ""))
+    c4.metric("K-BB%", fmt(row.get("K_minus_BB_pct"), ".1%", ""))
 
     if row.get("has_statcast"):
         st.markdown("**Contact allowed (Statcast, this level is publicly tracked)**")
         s1, s2, s3 = st.columns(3)
-        s1.metric("Avg Exit Velo Allowed", f"{row.get('avg_exit_velocity_allowed', 0):.1f} mph")
-        s2.metric("Hard-Hit% Allowed", f"{row.get('hard_hit_pct_allowed', 0):.1%}" if pd.notna(row.get("hard_hit_pct_allowed")) else "-")
-        s3.metric("Barrel% Allowed (approx)", f"{row.get('barrel_pct_approx_allowed', 0):.1%}" if pd.notna(row.get("barrel_pct_approx_allowed")) else "-")
+        s1.metric("Avg Exit Velo Allowed", fmt(row.get("avg_exit_velocity_allowed"), ".1f", " mph"))
+        s2.metric("Hard-Hit% Allowed", fmt(row.get("hard_hit_pct_allowed"), ".1%", ""))
+        s3.metric("Barrel% Allowed (approx)", fmt(row.get("barrel_pct_approx_allowed"), ".1%", ""))
     else:
         st.caption("No batted-ball Statcast available at this level.")
 
