@@ -15,6 +15,7 @@ requirements.txt should contain:
 """
 
 import datetime
+import io
 import os
 
 import pandas as pd
@@ -83,7 +84,7 @@ if os.path.exists(EXCEL_PATH):
     )
 
     try:
-        xl = pd.ExcelFile(file_bytes)
+        xl = pd.ExcelFile(io.BytesIO(file_bytes))
         sheet = st.selectbox("Preview a sheet", xl.sheet_names)
         df = pd.read_excel(xl, sheet)
         st.dataframe(df, use_container_width=True)
